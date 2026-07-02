@@ -308,7 +308,10 @@ def search_title(
       searchTerm: "__SEARCH_TERM__"
       isExactMatch: "__EXACT_MATCH__"
       type: [TITLE, NAME]
-      titleSearchOptions: { type: [__TYPES__] }
+      titleSearchOptions: { 
+          type: [__TYPES__]
+          releaseYear: __YEAR__
+      }
     }
   ) {
     edges {

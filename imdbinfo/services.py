@@ -283,7 +283,7 @@ def get_movie(imdb_id: str, locale: Optional[str] = None) -> Optional[MovieDetai
 def search_title(
     search_term: str,
     locale: Optional[str] = None,
-    exact_match: bool = False
+    exact_match: bool = False,
     title_type: Optional[TitleFilter] = None,
 ) -> Optional[SearchResult]:
     lang = _retrieve_url_lang(locale)

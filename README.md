@@ -312,6 +312,28 @@ for imdb_id in movies:
 ```
 
 
+### Proxy Support 🛡️
+
+You can pass an optional `proxies` argument to any data-fetching function to route your request through a proxy server. The `proxies` argument accepts either a standard `requests`-style dictionary or a single string if you use the same proxy for both HTTP and HTTPS.
+
+
+```python
+from imdbinfo import get_movie
+
+proxy_url = "http://username:password@domain:port"
+
+# 1. Pass as a single string
+movie = get_movie("tt0133093", proxies=proxy_url)
+
+# 2. Or pass as a dictionary
+movie = get_movie("tt0133093", proxies={
+    "http": proxy_url, 
+    "https": proxy_url
+})
+
+print(f"Title fetched via proxy: {movie.title}")
+```
+
 📝 For more examples see the [examples](examples/) folder.
 
 > 💡 **Looking for a ready-to-use API based on this package? Check out [qdMovieAPI](https://github.com/tveronesi/qdMovieAPI) — a fast and simple way to access IMDb data via REST!**

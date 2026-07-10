@@ -22,7 +22,7 @@ import random
 import re
 from pathlib import Path
 from typing import Optional, Dict, Union, List, Tuple, Any
-from functools import lru_cache
+from functools import lru_cache, wraps
 from time import time
 import logging
 import niquests
@@ -158,8 +158,8 @@ def get_cookies(text, user_agent, force=False):
         raise
 
 
-def request_json_url(url: str) -> Any:
-    resp = request_handler(url)
+def request_json_url(url: str, proxies: Optional[Dict] = None) -> Any:
+    resp = request_handler(url, proxies=proxies)
     if resp.status_code != 200:
         logger.error("Error fetching %s: %s", url, resp.status_code)
         response_text = (resp.text or "")[:500]
@@ -208,9 +208,9 @@ HEADERS = {
 }
 
 
-def request_handler(url: str) -> Any:
+def request_handler(url: str, proxies: Optional[Dict] = None) -> Any:
     waf_cookies = _load_waf_cookies()
-    resp = niquests.get(url, headers=HEADERS, cookies=waf_cookies)
+    resp = niquests.get(url, headers=HEADERS, cookies=waf_cookies, proxies=proxies)
     if resp.status_code == 200:
         return resp
     # Non-200: invalidate cached cookies and request fresh ones
@@ -224,7 +224,7 @@ def request_handler(url: str) -> Any:
         waf_cookies = get_cookies(resp.text, USER_AGENT)
         _save_waf_cookies(waf_cookies)
         logger.debug("WAF cookies refreshed — retrying %s", url)
-        resp = niquests.get(url, headers=HEADERS, cookies=waf_cookies)
+        resp = niquests.get(url, headers=HEADERS, cookies=waf_cookies, proxies=proxies)
         if resp.status_code != 200:
             logger.warning(
                 "Request still non-200 (%s) after WAF cookie refresh for %s — "
@@ -242,8 +242,8 @@ def request_handler(url: str) -> Any:
     return resp
 
 
-def request_graphql_url(headers, search_term, payload, url) -> Any:
-    resp = niquests.post(url, headers=headers, json=payload)
+def request_graphql_url(headers, search_term, payload, url, proxies: Optional[Dict] = None) -> Any:
+    resp = niquests.post(url, headers=headers, json=payload, proxies=proxies)
     if resp.status_code != 200:
         logger.error("GraphQL request failed: %s", resp.status_code)
         raise GraphQLError(
@@ -265,28 +265,60 @@ def request_graphql_url(headers, search_term, payload, url) -> Any:
     return data
 
 
-@lru_cache(maxsize=128)
-def get_movie(imdb_id: str, locale: Optional[str] = None) -> Optional[MovieDetail]:
+def hashable_lru_cache(maxsize=128):
+    def decorator(func):
+        @lru_cache(maxsize=maxsize)
+        def cached_wrapper(*args, **kwargs):
+            return func(*args, **kwargs)
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            proxies = kwargs.get('proxies')
+            if isinstance(proxies, dict):
+                kwargs['proxies'] = json.dumps(proxies, sort_keys=True)
+            return cached_wrapper(*args, **kwargs)
+        
+        wrapper.cache_clear = cached_wrapper.cache_clear
+        wrapper.cache_info = cached_wrapper.cache_info
+        return wrapper
+    return decorator
+
+
+def _parse_proxies(proxies: Optional[Union[Dict, str]]) -> Optional[Dict]:
+    if isinstance(proxies, str):
+        try:
+            return json.loads(proxies)
+        except json.JSONDecodeError:
+            return {"http": proxies, "https": proxies}
+    return proxies
+
+
+@hashable_lru_cache(maxsize=128)
+def get_movie(imdb_id: str, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None) -> Optional[MovieDetail]:
     """Fetch movie details from IMDb using the provided IMDb ID as string,
     preserve the 'tt' prefix or not, it will be stripped in the function.
     """
+    proxies_dict = _parse_proxies(proxies)
     imdb_id, lang = normalize_imdb_id(imdb_id, locale)
     url = f"https://www.imdb.com/{lang}/title/tt{imdb_id}/reference"
     logger.info("Fetching movie %s", imdb_id)
-    raw_json = request_json_url(url)
+    raw_json = request_json_url(url, proxies=proxies_dict)
     movie = parse_json_movie(raw_json)
     logger.debug("Fetched url %s", url)
     return movie
 
 
-@lru_cache(maxsize=128)
+@hashable_lru_cache(maxsize=128)
 def search_title(
     search_term: str,
     year: int | None = None,
     exact_match: bool = False,
     locale: Optional[str] = None,
     title_type: Optional[TitleFilter] = None,
+    *,
+    proxies: Optional[Union[Dict, str]] = None,
 ) -> Optional[SearchResult]:
+    proxies_dict = _parse_proxies(proxies)
     lang = _retrieve_url_lang(locale)
     country_code = _get_country_code_from_lang_locale(lang)
 
@@ -407,21 +439,23 @@ query {
         search_term=search_term,
         payload=payload,
         url=GRAPHQL_URL,
+        proxies=proxies_dict,
     )
 
     return parse_json_search(data)
 
 
-@lru_cache(maxsize=128)
-def get_name(person_id: str, locale: Optional[str] = None) -> Optional[PersonDetail]:
+@hashable_lru_cache(maxsize=128)
+def get_name(person_id: str, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None) -> Optional[PersonDetail]:
     """Fetch person details from IMDb using the provided IMDb ID.
     Preserve the 'nm' prefix or not, it will be stripped in the function.
     """
+    proxies_dict = _parse_proxies(proxies)
     person_id, lang = normalize_imdb_id(person_id, locale)
     url = f"https://www.imdb.com/{lang}/name/nm{person_id}/"
     t0 = time()
     logger.info("Fetching person %s", person_id)
-    raw_json = request_json_url(url)
+    raw_json = request_json_url(url, proxies=proxies_dict)
     t1 = time()
     logger.debug("Fetched person %s in %.2f seconds", person_id, t1 - t0)
     t0 = time()
@@ -431,34 +465,36 @@ def get_name(person_id: str, locale: Optional[str] = None) -> Optional[PersonDet
     return person
 
 
-@lru_cache(maxsize=128)
+@hashable_lru_cache(maxsize=128)
 def get_season_episodes(
-    imdb_id: str, season=1, locale: Optional[str] = None
+    imdb_id: str, season=1, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None
 ) -> SeasonEpisodesList:
     """Fetch episodes for a movie or series using the provided IMDb ID."""
+    proxies_dict = _parse_proxies(proxies)
     imdb_id, lang = normalize_imdb_id(imdb_id, locale)
     url = f"https://www.imdb.com/{lang}/title/tt{imdb_id}/episodes/?season={season}"
     logger.info("Fetching episodes for movie %s", imdb_id)
-    raw_json = request_json_url(url)
+    raw_json = request_json_url(url, proxies=proxies_dict)
     episodes = parse_json_season_episodes(raw_json)
     logger.debug("Fetched %d episodes for movie %s", len(episodes.episodes), imdb_id)
     return episodes
 
 
-@lru_cache(maxsize=128)
-def get_all_episodes(imdb_id: str, locale: Optional[str] = None):
+@hashable_lru_cache(maxsize=128)
+def get_all_episodes(imdb_id: str, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None):
+    proxies_dict = _parse_proxies(proxies)
     series_id, lang = normalize_imdb_id(imdb_id, locale)
     url = f"https://www.imdb.com/{lang}/search/title/?count=250&series=tt{series_id}&sort=release_date,asc"
     logger.info("Fetching bulk episodes for series %s", imdb_id)
-    raw_json = request_json_url(url)
+    raw_json = request_json_url(url, proxies=proxies_dict)
     episodes = parse_json_bulked_episodes(raw_json)
     logger.debug("Fetched %d episodes for series %s", len(episodes), imdb_id)
     return episodes
 
 
-@lru_cache(maxsize=128)
+@hashable_lru_cache(maxsize=128)
 def get_episodes(
-    imdb_id: str, season=1, locale: Optional[str] = None
+    imdb_id: str, season=1, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None
 ) -> SeasonEpisodesList:
     """wrap until deprecation : use get_season_episodes instead for seasons
     or get_all_episodes for all episodes
@@ -466,12 +502,12 @@ def get_episodes(
     logger.warning(
         "get_episodes is deprecating, use get_season_episodes or get_all_episodes instead."
     )
-    return get_season_episodes(imdb_id, season, locale)
+    return get_season_episodes(imdb_id, season, locale, proxies=proxies)
 
 
-def get_akas(imdb_id: str, locale: Optional[str] = None) -> Union[AkasData, list]:
+def get_akas(imdb_id: str, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None) -> Union[AkasData, list]:
     imdb_id, lang = normalize_imdb_id(imdb_id, locale)
-    raw_json = _get_extended_title_info(imdb_id, lang)
+    raw_json = _get_extended_title_info(imdb_id, lang, proxies=proxies)
     if not raw_json:
         logger.warning("No AKAs found for title %s", imdb_id)
         return []
@@ -480,7 +516,7 @@ def get_akas(imdb_id: str, locale: Optional[str] = None) -> Union[AkasData, list
     return akas
 
 
-def get_all_interests(imdb_id: str, locale: Optional[str] = None):
+def get_all_interests(imdb_id: str, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None):
     """
         Fetch all 'interests' for a title using the provided IMDb ID.
 
@@ -493,7 +529,7 @@ def get_all_interests(imdb_id: str, locale: Optional[str] = None):
     beyond what is available in movie.genres, as it can impact performance.
     """
     imdb_id, lang = normalize_imdb_id(imdb_id, locale)
-    raw_json = _get_extended_title_info(imdb_id, lang)
+    raw_json = _get_extended_title_info(imdb_id, lang, proxies=proxies)
     if not raw_json:
         logger.warning("No interests found for title %s", imdb_id)
         return []
@@ -508,9 +544,9 @@ def get_all_interests(imdb_id: str, locale: Optional[str] = None):
     return interests
 
 
-def get_trivia(imdb_id: str, locale: Optional[str] = None) -> List[Dict]:
+def get_trivia(imdb_id: str, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None) -> List[Dict]:
     imdb_id, lang = normalize_imdb_id(imdb_id, locale)
-    raw_json = _get_extended_title_info(imdb_id, lang)
+    raw_json = _get_extended_title_info(imdb_id, lang, proxies=proxies)
     if not raw_json:
         logger.warning("No trivia found for title %s", imdb_id)
         return []
@@ -519,9 +555,9 @@ def get_trivia(imdb_id: str, locale: Optional[str] = None) -> List[Dict]:
     return trivia_list
 
 
-def get_reviews(imdb_id: str, locale: Optional[str] = None) -> List[Dict]:
+def get_reviews(imdb_id: str, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None) -> List[Dict]:
     imdb_id, lang = normalize_imdb_id(imdb_id, locale)
-    raw_json = _get_extended_title_info(imdb_id, lang)
+    raw_json = _get_extended_title_info(imdb_id, lang, proxies=proxies)
     if not raw_json:
         logger.warning("No reviews found for title %s", imdb_id)
         return []
@@ -530,9 +566,9 @@ def get_reviews(imdb_id: str, locale: Optional[str] = None) -> List[Dict]:
     return reviews_list
 
 
-def get_parental_guide(imdb_id: str, locale: Optional[str] = None) -> Dict:
+def get_parental_guide(imdb_id: str, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None) -> Dict:
     imdb_id, lang = normalize_imdb_id(imdb_id, locale)
-    raw_json = _get_extended_title_info(imdb_id, lang)
+    raw_json = _get_extended_title_info(imdb_id, lang, proxies=proxies)
     if not raw_json:
         logger.warning("No parental guide found for title %s", imdb_id)
         return {}
@@ -541,12 +577,12 @@ def get_parental_guide(imdb_id: str, locale: Optional[str] = None) -> Dict:
     return parental_guide
 
 
-def get_filmography(imdb_id, locale: Optional[str] = None) -> dict:
+def get_filmography(imdb_id, locale: Optional[str] = None, *, proxies: Optional[Union[Dict, str]] = None) -> dict:
     """
     Fetch full filmography for a person using the provided IMDb ID.
     """
     imdb_id, lang = normalize_imdb_id(imdb_id, locale)
-    raw_json = _get_extended_name_info(imdb_id, lang)
+    raw_json = _get_extended_name_info(imdb_id, lang, proxies=proxies)
     if not raw_json:
         logger.warning("No full_credit found for name %s", imdb_id)
         return {}
@@ -555,12 +591,13 @@ def get_filmography(imdb_id, locale: Optional[str] = None) -> dict:
     return full_credits_list
 
 
-@lru_cache(maxsize=128)
-def _get_extended_title_info(imdb_id, locale=None) -> dict:
+@hashable_lru_cache(maxsize=128)
+def _get_extended_title_info(imdb_id, locale=None, *, proxies: Optional[Union[Dict, str]] = None) -> dict:
     """
     Fetch extended info using IMDb's GraphQL API:
     including akas, trivia, reviews, interests, and parental guide.
     """
+    proxies_dict = _parse_proxies(proxies)
     imdbId = "tt" + imdb_id
     country = _get_country_code_from_lang_locale(locale)
     url = GRAPHQL_URL
@@ -675,15 +712,17 @@ def _get_extended_title_info(imdb_id, locale=None) -> dict:
     )
     payload = {"query": query}
     logger.info("Fetching title %s from GraphQL API", imdb_id)
-    data = request_graphql_url(headers, imdbId, payload, url)
+    data = request_graphql_url(headers, imdbId, payload, url, proxies=proxies_dict)
     raw_json = data.get("data", {}).get("title", {})
     return raw_json
 
 
-def _get_extended_name_info(person_id, locale=None) -> dict:
+@hashable_lru_cache(maxsize=128)
+def _get_extended_name_info(person_id, locale=None, *, proxies: Optional[Union[Dict, str]] = None) -> dict:
     """
     Fetch extended person info using IMDb's GraphQL API.
     """
+    proxies_dict = _parse_proxies(proxies)
     person_id = "nm" + person_id
     country = _get_country_code_from_lang_locale(locale)
 
@@ -793,6 +832,6 @@ def _get_extended_name_info(person_id, locale=None) -> dict:
     }
     payload = {"query": query}
     logger.info("Fetching person %s from GraphQL API", person_id)
-    data = request_graphql_url(headers, person_id, payload, url)
+    data = request_graphql_url(headers, person_id, payload, url, proxies=proxies_dict)
     raw_json = data.get("data", {}).get("name", {})
     return raw_json
